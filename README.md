@@ -54,6 +54,18 @@ The tail loader only lists filenames containing `generation_tail_50_63`. Runtime
 
 The current quantized LM-head path supports the published ComfyUI `int8_tensorwise` ConvRot layout. Incompatible or incomplete tail artifacts fail with an explicit error instead of silently producing corrupted text.
 
+## Download the generation tails
+
+The compatible tail files are published in the [Qwen3-VL-32B H3 ComfyUI Generation Tails repository](https://huggingface.co/ethanfel/Qwen3-VL-32B-H3-ComfyUI-Generation-Tails). The repository may populate progressively while the initial upload is still running.
+
+Download the desired `generation_tail_50_63` `.safetensors` file into:
+
+```text
+ComfyUI/models/text_encoders/
+```
+
+Then restart ComfyUI or refresh its model list so the dedicated tail loader can discover it.
+
 ## Installation
 
 Place or link this folder inside ComfyUI's `custom_nodes` directory, put the H3 base text encoder and generation tail in `models/text_encoders`, then restart ComfyUI:
