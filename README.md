@@ -1,44 +1,68 @@
 # ComfyUI H3 Qwen3-VL Text Generation
 
-A small standalone ComfyUI node pack for using a complete Qwen3-VL or Qwen3.5-VL text encoder as a general-purpose local language and vision-language model. It has no MiniMax H3 dependency.
+A standalone ComfyUI node pack that turns MiniMax H3's truncated Qwen3-VL-32B text encoder into a local text and vision-language generator by reconnecting its published generation tail.
 
-## Node
+This pack is independent of the MiniMax H3 prompt-guide workflow. It reuses the same proven tail model and cleanup path, but its output is unrestricted general-purpose text rather than an H3 video prompt.
 
-`H3 Qwen VL Generate Text (Standalone)` accepts:
+## Nodes
 
-- a complete generation-capable Qwen3-VL or Qwen3.5-VL `CLIP`;
+### H3 Qwen VL Generation Tail Loader
+
+Selects a compatible `generation_tail_50_63` file from `models/text_encoders`. The tail contains:
+
+- Qwen3-VL-32B language layers 50–63;
+- the final normalization layer;
+- the language-model head.
+
+It is deliberately a dedicated typed loader rather than a standard `CLIP` loader. The tail is not a complete CLIP and has no tokenizer, token embeddings, or vision tower of its own.
+
+Its connection type and descriptor are compatible with the original H3 Guide pack's generation-tail loader, although this standalone pack does not require the Guide pack to be installed.
+
+### H3 Qwen VL Generate Text (Standalone)
+
+Combines:
+
+- `clip`: MiniMax H3's normal 50-layer Qwen3-VL-32B text encoder, loaded with ComfyUI's standard `Load CLIP` node;
+- `tail_clip`: output from `H3 Qwen VL Generation Tail Loader`;
 - separate editable system and user prompts;
 - an optional `IMAGE` batch;
 - deterministic or sampled decoding controls;
 - optional Qwen thinking mode.
 
-It returns cleaned text, the untouched decoded output, the exact textual chat prompt, the resolved system prompt, and a short generation report.
+It returns cleaned text, untouched decoded output, the textual chat prompt, the resolved system prompt, and a generation report.
 
-## Basic workflow
+## Required graph
 
-1. Load a complete instruction-tuned Qwen3-VL or Qwen3.5-VL checkpoint with a compatible ComfyUI CLIP loader.
-2. Connect its `CLIP` output to this node's `clip` input.
-3. Write the model's behavior in `system_prompt` and the current request in `prompt`.
-4. Optionally connect one image or an IMAGE batch.
-5. Read `generated_text`; use `raw_output` and `chat_prompt` when debugging.
+```text
+Load CLIP (MiniMax H3 TE) ── clip ──────┐
+                                        ├─ H3 Qwen VL Generate Text
+H3 Qwen VL Tail Loader ── tail_clip ────┘
+Optional IMAGE batch ───── image ───────┘
+```
 
-The image batch can be interpreted as its first image, the first N images, or N evenly sampled images. Every selected item is attached as a separate visual input in batch order. The default cap is eight because visual tokens substantially increase runtime and VRAM use.
+The normal H3 CLIP supplies tokenization, embeddings, vision processing, and language layers 0–49. During generation the node loads the tail as a second ComfyUI-managed model, runs layers 0–49 and 50–63 sequentially for every token, and evaluates the tail's final norm and LM head.
 
-## Important model distinction
+After generation, only the temporary tail is explicitly unloaded. The connected base CLIP remains under normal ComfyUI model-residency management.
 
-This node needs a complete language model with a final normalization layer and LM head. A truncated text encoder bundled only for diffusion conditioning cannot generate reliable text. In particular, the MiniMax H3 50-layer conditioning encoder and its H3-specific generation-tail workflow are intentionally outside this pack.
+## Images
 
-The node calls ComfyUI's public `clip.tokenize()`, `clip.generate()`, and `clip.decode()` flow. It never synchronously force-unloads the connected model; ComfyUI manages model residency.
+The optional IMAGE batch can be interpreted as its first image, the first N images, or N evenly sampled images. MiniMax H3's tokenizer prepends each selected image as a numbered `<Picture N>` visual block before the Qwen chat. The default cap is four because additional images increase vision encoding time, context length, and VRAM use.
+
+## Tail compatibility
+
+The tail loader only lists filenames containing `generation_tail_50_63`. Runtime validation additionally requires exactly source layers 50–63 plus `model.norm.weight` and `model.lm_head.weight`.
+
+The current quantized LM-head path supports the published ComfyUI `int8_tensorwise` ConvRot layout. Incompatible or incomplete tail artifacts fail with an explicit error instead of silently producing corrupted text.
 
 ## Installation
 
-Place or link this folder inside ComfyUI's `custom_nodes` directory, then restart ComfyUI:
+Place or link this folder inside ComfyUI's `custom_nodes` directory, put the H3 base text encoder and generation tail in `models/text_encoders`, then restart ComfyUI:
 
 ```text
 ComfyUI-H3-Qwen3VL-TextGen/
 ```
 
-No additional Python package is required beyond a current ComfyUI build with Qwen3-VL/Qwen3.5-VL support.
+No dependency on the separate H3 Guide custom-node pack is required.
 
 ## Development
 

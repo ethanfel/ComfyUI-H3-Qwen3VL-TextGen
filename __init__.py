@@ -1,4 +1,4 @@
-"""Standalone Qwen3-VL and Qwen3.5-VL text generation nodes for ComfyUI."""
+"""Standalone generation with MiniMax H3's Qwen3-VL base and tail."""
 
 if __package__:
     from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

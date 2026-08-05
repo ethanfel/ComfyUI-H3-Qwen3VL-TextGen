@@ -1,4 +1,4 @@
-"""Standalone text and vision-language generation with ComfyUI Qwen CLIPs."""
+"""Standalone text generation with MiniMax H3's base CLIP and Qwen tail."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "Return only the requested answer unless an explanation is requested."
 )
 
-VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
+# Match the original H3 Guide pack so either dedicated tail-loader output can
+# connect when both packs are installed. The descriptor shape is identical too.
+TAIL_TYPE = "MINIMAX_H3_GENERATION_TAIL"
+NO_TAIL_FOUND = "[no H3 generation_tail_50_63 file found]"
 
 
 def _tokenizer_identity(clip: Any) -> str:
@@ -20,40 +23,80 @@ def _tokenizer_identity(clip: Any) -> str:
     return f"{tokenizer_type.__module__}.{tokenizer_type.__name__}"
 
 
-def _is_qwen_vl_tokenizer(clip: Any) -> bool:
-    identity = _tokenizer_identity(clip).casefold()
-    return any(
-        marker in identity for marker in ("qwen3vl", "qwen3_vl", "qwen35", "qwen3_5")
+def _is_minimax_h3_tokenizer(clip: Any) -> bool:
+    tokenizer = getattr(clip, "tokenizer", None)
+    tokenizer_type = type(tokenizer)
+    return tokenizer_type.__name__ == "MiniMaxH3Tokenizer" or (
+        tokenizer_type.__module__.endswith(".minimax")
     )
 
 
-def validate_qwen_clip(clip: Any) -> tuple[str, bool]:
-    """Validate the public generation interface and reject known wrong CLIPs."""
+def validate_h3_base_clip(clip: Any) -> str:
+    """Require the standard 50-layer MiniMax H3 conditioning CLIP."""
 
     if clip is None:
         raise RuntimeError(
-            "Qwen VL Generate Text needs a complete generation-capable CLIP input."
+            "H3 Qwen VL Generate Text needs the 50-layer MiniMax H3 CLIP input."
         )
 
-    required = ("tokenize", "generate", "decode")
+    required = ("tokenize", "decode")
     missing = [name for name in required if not callable(getattr(clip, name, None))]
     if missing:
         raise RuntimeError(
-            "The connected CLIP cannot generate text because it is missing callable "
+            "The connected base CLIP is missing callable "
             + ", ".join(missing)
-            + ". Connect a complete instruction-tuned Qwen3-VL or Qwen3.5-VL CLIP."
+            + ". Connect MiniMax H3's normal Qwen3-VL-32B text encoder from "
+            "ComfyUI's Load CLIP node."
         )
 
     identity = _tokenizer_identity(clip)
-    recognized = _is_qwen_vl_tokenizer(clip)
-    if identity.casefold().startswith("comfy.") and not recognized:
+    if not _is_minimax_h3_tokenizer(clip):
         raise RuntimeError(
-            "The connected ComfyUI CLIP uses "
-            f"{identity}, not a supported Qwen3-VL/Qwen3.5-VL tokenizer. "
-            "A diffusion conditioning encoder or the truncated MiniMax H3 encoder is "
-            "not a standalone language model."
+            f"The connected CLIP uses {identity}. This generator specifically needs "
+            "MiniMax H3's 50-layer Qwen3-VL-32B conditioning CLIP; its dedicated "
+            "tail input supplies layers 50-63, final norm, and the LM head."
         )
-    return identity, recognized
+    return identity
+
+
+def _tail_choices() -> list[str]:
+    """List only the tail artifacts compatible with the H3 50-layer base."""
+
+    try:
+        import folder_paths
+    except ImportError:
+        return [NO_TAIL_FOUND]
+    names = [
+        name
+        for name in folder_paths.get_filename_list("text_encoders")
+        if "generation_tail_50_63" in name.casefold()
+    ]
+    return sorted(names, key=str.casefold) or [NO_TAIL_FOUND]
+
+
+def _resolve_tail_name(tail_clip: Any) -> str:
+    if isinstance(tail_clip, str):
+        name = tail_clip
+    elif isinstance(tail_clip, dict):
+        name = tail_clip.get("tail_name")
+    else:
+        name = None
+    if not isinstance(name, str) or not name or name == NO_TAIL_FOUND:
+        raise ValueError(
+            "tail_clip must come from H3 Qwen VL Generation Tail Loader. Place a "
+            "compatible generation_tail_50_63 file in models/text_encoders first."
+        )
+    return name
+
+
+def _generate_with_tail(clip, tail_name: str, tokens, generation_options: dict):
+    """Lazy import keeps node discovery and isolated tests lightweight."""
+
+    try:
+        from .hybrid_tail import generate_with_tail
+    except ImportError:
+        from hybrid_tail import generate_with_tail
+    return generate_with_tail(clip, tail_name, tokens, generation_options)
 
 
 def _image_count(image: Any) -> int:
@@ -99,10 +142,9 @@ def select_images(image: Any, batch_mode: str, max_images: int) -> list[Any]:
 def format_qwen_chat(
     system_prompt: str,
     user_prompt: str,
-    visual_count: int,
     thinking: bool,
 ) -> str:
-    """Build a complete Qwen chat with one visual token per attached image."""
+    """Build Qwen chat text; the H3 tokenizer prepends attached image blocks."""
 
     user = (user_prompt or "").strip()
     if not user:
@@ -112,12 +154,7 @@ def format_qwen_chat(
     system = (system_prompt or "").strip()
     if system:
         parts.append(f"<|im_start|>system\n{system}<|im_end|>\n")
-    visual_prefix = VISION_BLOCK * max(0, int(visual_count))
-    if visual_prefix:
-        visual_prefix += "\n"
-    parts.append(
-        f"<|im_start|>user\n{visual_prefix}{user}<|im_end|>\n<|im_start|>assistant\n"
-    )
+    parts.append(f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     if not thinking:
         # Qwen3 convention for disabling reasoning. Because this node supplies a
         # complete chat template, the tokenizer will not append it for us.
@@ -141,8 +178,52 @@ def clean_generated_text(text: str) -> str:
     return value.strip()
 
 
+class H3QwenVLGenerationTailLoader:
+    """Select the exact H3 generation tail; the generator loads it lazily."""
+
+    CATEGORY = "H3 Qwen VL/Loaders"
+    FUNCTION = "select_tail"
+    RETURN_TYPES = (TAIL_TYPE,)
+    RETURN_NAMES = ("tail_clip",)
+    OUTPUT_TOOLTIPS = (
+        "Connect to H3 Qwen VL Generate Text.tail_clip. The selected layers "
+        "50-63, final norm, and LM head are loaded only during generation.",
+    )
+    DESCRIPTION = (
+        "Dedicated companion loader for MiniMax H3's Qwen3-VL-32B generation "
+        "tail. The tail is not a complete CLIP: it reuses embeddings, vision, "
+        "tokenizer, and layers 0-49 from the normal H3 CLIP input."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tail_name": (
+                    _tail_choices(),
+                    {
+                        "tooltip": (
+                            "Select the H3 Qwen3-VL-32B generation tail containing "
+                            "exactly layers 50-63, model.norm, and model.lm_head. "
+                            "Tail files are discovered in models/text_encoders."
+                        )
+                    },
+                )
+            }
+        }
+
+    def select_tail(self, tail_name: str):
+        if tail_name == NO_TAIL_FOUND:
+            raise FileNotFoundError(
+                "No compatible H3 generation tail was found. Put the published "
+                "generation_tail_50_63 safetensors file in models/text_encoders, "
+                "then refresh ComfyUI."
+            )
+        return ({"tail_name": tail_name},)
+
+
 class H3QwenVLGenerateText:
-    """Generate general-purpose text with a complete Qwen vision-language CLIP."""
+    """Generate text through H3 base layers 0-49 and a connected tail 50-63."""
 
     CATEGORY = "H3 Qwen VL/Text"
     FUNCTION = "generate_text"
@@ -157,14 +238,15 @@ class H3QwenVLGenerateText:
     OUTPUT_TOOLTIPS = (
         "Clean answer text. Completed <think> reasoning and outer Qwen chat markers are removed when clean_output is enabled.",
         "Exact text decoded from the model, retained for debugging reasoning or tokenizer behavior.",
-        "Exact textual Qwen chat sent to the tokenizer. Image pixels are supplied separately through visual tokens.",
+        "Exact textual Qwen chat sent to the H3 tokenizer. The tokenizer prepends attached picture blocks separately.",
         "The system prompt used for this generation, echoed so it can be saved or edited downstream.",
-        "Detected tokenizer, image count, sampling mode, and model-residency behavior.",
+        "Detected H3 base, selected tail, image count, sampling mode, and cleanup behavior.",
     )
     DESCRIPTION = (
-        "Standalone Qwen3-VL/Qwen3.5-VL language-model generation. Connect a complete "
-        "generation-capable ComfyUI CLIP and optionally an IMAGE batch. This node has no "
-        "MiniMax H3 dependency and never force-unloads the connected model."
+        "Standalone language generation using MiniMax H3's normal 50-layer "
+        "Qwen3-VL-32B conditioning CLIP plus the dedicated generation tail. Connect "
+        "both loader outputs. The base CLIP is preserved; the temporary tail is "
+        "unloaded after each generation."
     )
 
     @classmethod
@@ -176,9 +258,19 @@ class H3QwenVLGenerateText:
                     "CLIP",
                     {
                         "tooltip": (
-                            "Connect a complete instruction-tuned Qwen3-VL or Qwen3.5-VL "
-                            "model from a ComfyUI CLIP loader. Truncated diffusion text "
-                            "encoders cannot generate text."
+                            "Connect MiniMax H3's normal 50-layer Qwen3-VL-32B text "
+                            "encoder from ComfyUI's Load CLIP node. This supplies the "
+                            "tokenizer, embeddings, vision tower, and layers 0-49."
+                        )
+                    },
+                ),
+                "tail_clip": (
+                    TAIL_TYPE,
+                    {
+                        "tooltip": (
+                            "Connect H3 Qwen VL Generation Tail Loader. It supplies "
+                            "layers 50-63, final normalization, and the language-model "
+                            "head only while text is generated."
                         )
                     },
                 ),
@@ -209,11 +301,12 @@ class H3QwenVLGenerateText:
                     {
                         "default": 512,
                         "min": 1,
-                        "max": 32768,
+                        "max": 4096,
                         "step": 1,
                         "tooltip": (
                             "Maximum number of tokens the model may generate. This does not "
-                            "shorten the input prompt or visual tokens."
+                            "shorten the input prompt or visual tokens. Higher values reserve "
+                            "larger KV caches across all 64 language layers."
                         ),
                     },
                 ),
@@ -325,7 +418,7 @@ class H3QwenVLGenerateText:
                 "max_images": (
                     "INT",
                     {
-                        "default": 8,
+                        "default": 4,
                         "min": 1,
                         "max": 64,
                         "step": 1,
@@ -362,6 +455,7 @@ class H3QwenVLGenerateText:
     def generate_text(
         self,
         clip,
+        tail_clip,
         system_prompt: str,
         prompt: str,
         max_new_tokens: int,
@@ -379,12 +473,12 @@ class H3QwenVLGenerateText:
         clean_output: bool,
         image=None,
     ):
-        identity, recognized = validate_qwen_clip(clip)
+        identity = validate_h3_base_clip(clip)
+        tail_name = _resolve_tail_name(tail_clip)
         images = select_images(image, image_batch_mode, max_images)
         chat_prompt = format_qwen_chat(
             system_prompt,
             prompt,
-            visual_count=len(images),
             thinking=thinking,
         )
         tokenize_options = {
@@ -393,11 +487,10 @@ class H3QwenVLGenerateText:
             "thinking": thinking,
         }
         if images:
-            # Current ComfyUI Qwen3-VL and Qwen3.5 tokenizers accept `images`.
-            # `image` is also supplied for compatible third-party wrappers that
-            # only implement the native single/batched-image argument.
+            # MiniMaxH3Tokenizer prepends numbered picture blocks and replaces
+            # each visual entry with the real image tensor. Do not also place
+            # generic Qwen vision-pad text inside the chat or images duplicate.
             tokenize_options["images"] = images
-            tokenize_options["image"] = image
 
         tokens = clip.tokenize(chat_prompt, **tokenize_options)
         generation_options = {
@@ -411,7 +504,7 @@ class H3QwenVLGenerateText:
             "presence_penalty": float(presence_penalty),
             "seed": int(seed),
         }
-        generated_ids = clip.generate(tokens, **generation_options)
+        generated_ids = _generate_with_tail(clip, tail_name, tokens, generation_options)
         raw_output = str(clip.decode(generated_ids) or "")
         generated_text = (
             clean_generated_text(raw_output) if clean_output else raw_output
@@ -419,16 +512,15 @@ class H3QwenVLGenerateText:
         if not generated_text.strip():
             raise RuntimeError(
                 "Qwen decoded an empty answer. Try more output tokens, deterministic "
-                "sampling, or verify that the connected CLIP includes its final norm and LM head."
+                "sampling, or verify that the connected tail includes its final norm "
+                "and LM head."
             )
 
-        recognition = (
-            "recognized Qwen VL tokenizer" if recognized else "custom tokenizer"
-        )
         report = (
-            f"Generation completed with {identity} ({recognition}); "
+            f"Generation completed with H3 base {identity} and tail {tail_name}; "
             f"{len(images)} image(s); sampling={sampling}; thinking={str(thinking).lower()}. "
-            "The connected CLIP was not explicitly unloaded; ComfyUI manages model residency."
+            "The temporary tail was unloaded after generation. The connected base CLIP "
+            "was left under ComfyUI model-residency management."
         )
         return (
             generated_text,
@@ -439,7 +531,11 @@ class H3QwenVLGenerateText:
         )
 
 
-NODE_CLASS_MAPPINGS = {"H3QwenVLGenerateText": H3QwenVLGenerateText}
+NODE_CLASS_MAPPINGS = {
+    "H3QwenVLGenerationTailLoader": H3QwenVLGenerationTailLoader,
+    "H3QwenVLGenerateText": H3QwenVLGenerateText,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "H3QwenVLGenerateText": "H3 Qwen VL Generate Text (Standalone)"
+    "H3QwenVLGenerationTailLoader": "H3 Qwen VL Generation Tail Loader",
+    "H3QwenVLGenerateText": "H3 Qwen VL Generate Text (Standalone)",
 }
