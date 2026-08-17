@@ -3,11 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = (
-    ROOT
-    / "example_workflows"
-    / "h3_qwen_vl_standalone_polaris_overlay.json"
-)
+WORKFLOW = ROOT / "example_workflows" / "h3_qwen_vl_standalone_polaris_overlay.json"
 OVERLAY = (
     "MiniMax H3/minimax_h3_qwen3vl32b__prompt_generation_overlay__"
     "polaris_r16_plus_heretic_v2.safetensors"
@@ -37,6 +33,11 @@ def test_example_workflow_uses_matching_h3_models_and_overlay():
         "overlay_strength",
     ]
     assert generator["widgets_values"][:2] == [OVERLAY, 1.0]
+    assert generator["widgets_values"][-2:] == [
+        "SageAttention 2",
+        "auto (Comfy Kitchen if available)",
+    ]
+    assert input_names[-3:] == ["attention_backend", "decode_backend", "image"]
 
     urls = [
         model["url"]

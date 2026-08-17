@@ -4,7 +4,11 @@ import pytest
 
 import nodes
 from nodes import (
+    ATTENTION_AUTO,
+    ATTENTION_SAGE2,
     DEFAULT_SYSTEM_PROMPT,
+    DECODE_AUTO,
+    DECODE_STANDARD,
     H3QwenVLGenerateText,
     H3QwenVLGenerationTailLoader,
     NO_OVERLAY,
@@ -81,6 +85,9 @@ def test_two_loader_schema_requires_base_clip_and_dedicated_tail():
     assert generator["required"]["tail_clip"][0] == TAIL_TYPE
     assert generator["required"]["generation_overlay"][0][0] == NO_OVERLAY
     assert generator["required"]["overlay_strength"][1]["default"] == 1.0
+    assert generator["required"]["attention_backend"][0][1] == ATTENTION_SAGE2
+    assert generator["required"]["attention_backend"][1]["default"] == (ATTENTION_AUTO)
+    assert generator["required"]["decode_backend"][1]["default"] == DECODE_AUTO
     assert "tail_name" in loader["required"]
     assert H3QwenVLGenerationTailLoader.RETURN_TYPES == (TAIL_TYPE,)
     assert H3QwenVLGenerationTailLoader.RETURN_NAMES == ("tail_clip",)
@@ -132,9 +139,24 @@ def test_generation_routes_base_tokens_and_images_through_tail(monkeypatch):
         options,
         overlay_name=None,
         overlay_strength=1.0,
+        attention_backend="auto",
+        decode_backend="auto",
+        runtime_report=None,
     ):
+        runtime_report.update(
+            {"attention": "ComfyUI automatic", "decode": "standard KV cache"}
+        )
         tail_calls.append(
-            (base, tail_name, tokens, options, overlay_name, overlay_strength)
+            (
+                base,
+                tail_name,
+                tokens,
+                options,
+                overlay_name,
+                overlay_strength,
+                attention_backend,
+                decode_backend,
+            )
         )
         return [101, 102]
 
@@ -171,11 +193,15 @@ def test_generation_routes_base_tokens_and_images_through_tail(monkeypatch):
             },
             None,
             1.0,
+            "auto",
+            "auto",
         )
     ]
     assert "3 image(s)" in report
     assert "temporary tail was unloaded" in report
     assert "base CLIP weights were left unchanged" in report
+    assert "attention=ComfyUI automatic" in report
+    assert "decode=standard KV cache" in report
 
 
 def test_generation_overlay_is_forwarded_only_to_text_generation(monkeypatch):
@@ -201,9 +227,38 @@ def test_generation_overlay_is_forwarded_only_to_text_generation(monkeypatch):
     assert calls[0][1] == {
         "overlay_name": "MiniMax H3/h3_prompt_generation_overlay_test.safetensors",
         "overlay_strength": 0.8,
+        "attention_backend": "auto",
+        "decode_backend": "auto",
+        "runtime_report": {},
     }
     assert "generation overlay=MiniMax H3/" in result[-1]
     assert "at 0.8" in result[-1]
+
+
+def test_sage2_and_standard_decode_are_forwarded(monkeypatch):
+    clip = FakeClip(decoded="answer")
+    calls = []
+
+    def generate_with_tail(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["runtime_report"].update(
+            {"attention": "SageAttention 2", "decode": "standard KV cache"}
+        )
+        return [101, 102]
+
+    monkeypatch.setattr(nodes, "_generate_with_tail", generate_with_tail)
+    result = H3QwenVLGenerateText().generate_text(
+        **generation_kwargs(
+            clip=clip,
+            attention_backend=ATTENTION_SAGE2,
+            decode_backend=DECODE_STANDARD,
+        )
+    )
+
+    assert calls[0][1]["attention_backend"] == "sage"
+    assert calls[0][1]["decode_backend"] == "standard"
+    assert "attention=SageAttention 2" in result[-1]
+    assert "decode=standard KV cache" in result[-1]
 
 
 def test_deterministic_generation_disables_tail_sampling(monkeypatch):

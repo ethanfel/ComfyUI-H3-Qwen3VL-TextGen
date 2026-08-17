@@ -69,7 +69,7 @@
       "id": 3,
       "type": "H3QwenVLGenerateText",
       "pos": [-250, -120],
-      "size": [620, 930],
+      "size": [620, 1030],
       "flags": {},
       "order": 2,
       "mode": 0,
@@ -93,6 +93,8 @@
         {"name": "image_batch_mode", "type": "COMBO", "widget": {"name": "image_batch_mode"}, "link": null},
         {"name": "max_images", "type": "INT", "widget": {"name": "max_images"}, "link": null},
         {"name": "clean_output", "type": "BOOLEAN", "widget": {"name": "clean_output"}, "link": null},
+        {"name": "attention_backend", "type": "COMBO", "widget": {"name": "attention_backend"}, "link": null},
+        {"name": "decode_backend", "type": "COMBO", "widget": {"name": "decode_backend"}, "link": null},
         {"name": "image", "type": "IMAGE", "shape": 7, "link": null}
       ],
       "outputs": [
@@ -129,7 +131,9 @@
         false,
         "all images from start",
         4,
-        true
+        true,
+        "SageAttention 2",
+        "auto (Comfy Kitchen if available)"
       ]
     },
     {
@@ -175,7 +179,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "EXPERIMENTAL GENERATION OVERLAY\n\nThis workflow applies Polaris r16 + Heretic-v2 only while Qwen generates text. It does not alter the MiniMax H3 encoder used for video conditioning.\n\nThe INT8 base encoder and INT8 generation tail are a matched pair. Set generation_overlay to [none] to compare against official Qwen behavior.\n\nAn IMAGE or IMAGE batch may be connected to the optional image input."
+        "EXPERIMENTAL GENERATION OVERLAY\n\nThis workflow applies Polaris r16 + Heretic-v2 only while Qwen generates text. It does not alter the MiniMax H3 encoder used for video conditioning.\n\nThe INT8 base encoder and INT8 generation tail are a matched pair. Set generation_overlay to [none] to compare against official Qwen behavior.\n\nAttention defaults here to SageAttention 2 (ComfyUI's sage backend). On Blackwell, install a SageAttention 2 build compiled for SM120. Comfy Kitchen fixed-KV decoding is enabled automatically when supported.\n\nAn IMAGE or IMAGE batch may be connected to the optional image input."
       ]
     }
   ],

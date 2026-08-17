@@ -7,9 +7,11 @@ and the LM head while text is generated. It never changes the connected CLIP.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import gc
 import re
+import threading
 import traceback
 
 import torch
@@ -33,10 +35,17 @@ RUNTIME_HEADROOM = 6 * 1024**3
 LM_HEAD_CHUNK_ROWS = 4096
 LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
 OVERLAY_PREFIX = "text_encoders.qwen3vl_32b.transformer.model"
-OVERLAY_KEY = re.compile(
-    rf"^{re.escape(OVERLAY_PREFIX)}\.layers\.(\d+)\.(.+)$"
-)
+OVERLAY_KEY = re.compile(rf"^{re.escape(OVERLAY_PREFIX)}\.layers\.(\d+)\.(.+)$")
 EXPECTED_ADAPTERS_PER_LAYER = 7
+ATTENTION_BACKEND_NAMES = {
+    "auto": "ComfyUI automatic",
+    "sage": "SageAttention 2",
+    "comfy_kitchen_int8": "Comfy Kitchen INT8",
+    "pytorch": "PyTorch SDPA",
+}
+DECODE_BACKENDS = {"auto", "comfy_kitchen", "standard"}
+_ATTENTION_OVERRIDE_LOCK = threading.RLock()
+_MISSING = object()
 
 
 def _layout_name(weight):
@@ -155,23 +164,7 @@ class Qwen3VL32BGenerationTail(torch.nn.Module):
         del self.model.embed_tokens
 
     def init_kv_cache(self, batch, max_cache_len, device, execution_dtype):
-        config = self.model.config
-        return [
-            (
-                torch.empty(
-                    [batch, config.num_key_value_heads, max_cache_len, config.head_dim],
-                    device=device,
-                    dtype=execution_dtype,
-                ),
-                torch.empty(
-                    [batch, config.num_key_value_heads, max_cache_len, config.head_dim],
-                    device=device,
-                    dtype=execution_dtype,
-                ),
-                0,
-            )
-            for _ in range(config.num_hidden_layers)
-        ]
+        return self.model.init_kv_cache(batch, max_cache_len, device, execution_dtype)
 
     def forward(self, hidden, position_ids, past_key_values):
         return self.model(
@@ -353,8 +346,7 @@ def _clone_base_with_overlay(clip, state, strength):
     loaded = comfy.lora.load_lora(state, key_map, log_missing=False)
     if len(loaded) != len(prefixes):
         raise ValueError(
-            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} "
-            "base adapters"
+            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} base adapters"
         )
     patched = clip.clone()
     _attach_bypass_adapters(
@@ -375,16 +367,13 @@ def _attach_tail_overlay(tail, patcher, state, strength):
         match = OVERLAY_KEY.match(prefix)
         global_layer = int(match.group(1))
         module = match.group(2)
-        target = (
-            f"model.layers.{global_layer - TAIL_FIRST_LAYER}.{module}.weight"
-        )
+        target = f"model.layers.{global_layer - TAIL_FIRST_LAYER}.{module}.weight"
         if target in tail_keys:
             key_map[prefix] = target
     loaded = comfy.lora.load_lora(state, key_map, log_missing=False)
     if len(loaded) != len(prefixes):
         raise ValueError(
-            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} "
-            "tail adapters"
+            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} tail adapters"
         )
     _attach_bypass_adapters(
         patcher,
@@ -467,12 +456,120 @@ def _validate_finite_logits(
     raise FloatingPointError(
         "H3 text generation produced NaN or Inf at generated token "
         f"{int(step) + 1} in {stage} ({overlay}). Sampling was stopped before "
-        "torch.multinomial to avoid a fatal CUDA device-side assertion."
-        + hint
+        "torch.multinomial to avoid a fatal CUDA device-side assertion." + hint
     )
 
 
-def _generate_tail_tokens(
+def _resolve_attention_function(attention_backend):
+    if attention_backend not in ATTENTION_BACKEND_NAMES:
+        raise ValueError(
+            "attention_backend must be one of "
+            + ", ".join(sorted(ATTENTION_BACKEND_NAMES))
+        )
+    if attention_backend == "auto":
+        return None
+
+    try:
+        from comfy.ldm.modules.attention import get_attention_function
+
+        return get_attention_function(attention_backend)
+    except (ImportError, KeyError) as exc:
+        if attention_backend == "sage":
+            guidance = (
+                "Install a SageAttention 2 build compatible with your GPU "
+                "(SM120 on Blackwell) in ComfyUI's Python environment."
+            )
+        elif attention_backend == "comfy_kitchen_int8":
+            guidance = (
+                "Install or update Comfy Kitchen to a build with INT8 attention "
+                "support."
+            )
+        else:
+            guidance = "Update ComfyUI to a build that registers this backend."
+        raise RuntimeError(
+            f"The requested {ATTENTION_BACKEND_NAMES[attention_backend]} backend "
+            f"is unavailable. {guidance}"
+        ) from exc
+
+
+def _comfy_kitchen_decode_available(device):
+    try:
+        import comfy_kitchen
+
+        checker = getattr(comfy_kitchen, "flash_attention_decode_is_available")
+        return bool(checker(device))
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        return False
+
+
+@contextmanager
+def _use_attention_runtime(
+    base,
+    tail,
+    load_device,
+    attention_backend="auto",
+    decode_backend="auto",
+    runtime_report=None,
+):
+    """Temporarily select Qwen attention and KV-cache implementations."""
+
+    if decode_backend not in DECODE_BACKENDS:
+        raise ValueError(
+            "decode_backend must be one of " + ", ".join(sorted(DECODE_BACKENDS))
+        )
+
+    attention_function = _resolve_attention_function(attention_backend)
+    fixed_kv_available = _comfy_kitchen_decode_available(load_device)
+    if decode_backend == "comfy_kitchen" and not fixed_kv_available:
+        raise RuntimeError(
+            "Comfy Kitchen fixed-KV Flash Attention decode was explicitly "
+            "requested but is unavailable on this device/build."
+        )
+    fixed_kv_enabled = fixed_kv_available and decode_backend != "standard"
+
+    models = (base.model, tail.model)
+
+    with _ATTENTION_OVERRIDE_LOCK:
+        old_fixed_kv = [getattr(model, "fixed_kv", _MISSING) for model in models]
+        old_selector = getattr(llama, "optimized_attention_for_device", _MISSING)
+        try:
+            if attention_function is not None:
+                if old_selector is _MISSING:
+                    raise RuntimeError(
+                        "This ComfyUI build does not expose Qwen's attention selector."
+                    )
+
+                def select_attention(_device, mask=False, small_input=False):
+                    del mask, small_input
+                    return attention_function
+
+                llama.optimized_attention_for_device = select_attention
+
+            for model in models:
+                model.fixed_kv = fixed_kv_enabled
+
+            if runtime_report is not None:
+                runtime_report["attention"] = ATTENTION_BACKEND_NAMES[attention_backend]
+                if fixed_kv_enabled:
+                    runtime_report["decode"] = "Comfy Kitchen fixed-KV Flash Attention"
+                elif decode_backend == "auto":
+                    runtime_report["decode"] = (
+                        "standard KV cache (Comfy Kitchen unavailable)"
+                    )
+                else:
+                    runtime_report["decode"] = "standard KV cache"
+            yield
+        finally:
+            if attention_function is not None and old_selector is not _MISSING:
+                llama.optimized_attention_for_device = old_selector
+            for model, old_value in zip(models, old_fixed_kv):
+                if old_value is _MISSING:
+                    delattr(model, "fixed_kv")
+                else:
+                    model.fixed_kv = old_value
+
+
+def _generate_tail_tokens_inner(
     wrapper,
     base,
     tail,
@@ -561,6 +658,39 @@ def _generate_tail_tokens(
     return generated
 
 
+def _generate_tail_tokens(
+    wrapper,
+    base,
+    tail,
+    tokens,
+    generation_options,
+    load_device,
+    overlay_name=None,
+    overlay_strength=1.0,
+    attention_backend="auto",
+    decode_backend="auto",
+    runtime_report=None,
+):
+    with _use_attention_runtime(
+        base,
+        tail,
+        load_device,
+        attention_backend,
+        decode_backend,
+        runtime_report,
+    ):
+        return _generate_tail_tokens_inner(
+            wrapper,
+            base,
+            tail,
+            tokens,
+            generation_options,
+            load_device,
+            overlay_name,
+            overlay_strength,
+        )
+
+
 def generate_with_tail(
     clip,
     tail_name,
@@ -568,6 +698,9 @@ def generate_with_tail(
     generation_options,
     overlay_name=None,
     overlay_strength=1.0,
+    attention_backend="auto",
+    decode_backend="auto",
+    runtime_report=None,
 ):
     """Generate through base layers 0..49 and a temporary tail 50..63."""
 
@@ -596,9 +729,7 @@ def generate_with_tail(
         old_execution_device = wrapper.execution_device
         tail, tail_patcher = _build_tail(tail_name, load_device, offload_device)
         if overlay_state is not None:
-            _attach_tail_overlay(
-                tail, tail_patcher, overlay_state, overlay_strength
-            )
+            _attach_tail_overlay(tail, tail_patcher, overlay_state, overlay_strength)
         comfy.model_management.load_models_gpu(
             [working_clip.patcher, tail_patcher], memory_required=RUNTIME_HEADROOM
         )
@@ -615,6 +746,9 @@ def generate_with_tail(
             load_device,
             overlay_name,
             overlay_strength,
+            attention_backend,
+            decode_backend,
+            runtime_report,
         )
     except BaseException as exc:
         primary_error = exc

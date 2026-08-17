@@ -16,6 +16,31 @@ DEFAULT_SYSTEM_PROMPT = (
 TAIL_TYPE = "MINIMAX_H3_GENERATION_TAIL"
 NO_TAIL_FOUND = "[no H3 generation_tail_50_63 file found]"
 NO_OVERLAY = "[none — use official H3 generation weights]"
+ATTENTION_AUTO = "auto (ComfyUI default)"
+ATTENTION_SAGE2 = "SageAttention 2"
+ATTENTION_COMFY_KITCHEN = "Comfy Kitchen INT8"
+ATTENTION_PYTORCH = "PyTorch SDPA"
+ATTENTION_BACKENDS = (
+    ATTENTION_AUTO,
+    ATTENTION_SAGE2,
+    ATTENTION_COMFY_KITCHEN,
+    ATTENTION_PYTORCH,
+)
+ATTENTION_BACKEND_IDS = {
+    ATTENTION_AUTO: "auto",
+    ATTENTION_SAGE2: "sage",
+    ATTENTION_COMFY_KITCHEN: "comfy_kitchen_int8",
+    ATTENTION_PYTORCH: "pytorch",
+}
+DECODE_AUTO = "auto (Comfy Kitchen if available)"
+DECODE_COMFY_KITCHEN = "require Comfy Kitchen fixed-KV"
+DECODE_STANDARD = "standard KV cache"
+DECODE_BACKENDS = (DECODE_AUTO, DECODE_COMFY_KITCHEN, DECODE_STANDARD)
+DECODE_BACKEND_IDS = {
+    DECODE_AUTO: "auto",
+    DECODE_COMFY_KITCHEN: "comfy_kitchen",
+    DECODE_STANDARD: "standard",
+}
 
 
 def _tokenizer_identity(clip: Any) -> str:
@@ -112,6 +137,9 @@ def _generate_with_tail(
     generation_options: dict,
     overlay_name: str | None = None,
     overlay_strength: float = 1.0,
+    attention_backend: str = "auto",
+    decode_backend: str = "auto",
+    runtime_report: dict | None = None,
 ):
     """Lazy import keeps node discovery and isolated tests lightweight."""
 
@@ -126,6 +154,9 @@ def _generate_with_tail(
         generation_options,
         overlay_name=overlay_name,
         overlay_strength=overlay_strength,
+        attention_backend=attention_backend,
+        decode_backend=decode_backend,
+        runtime_report=runtime_report,
     )
 
 
@@ -493,6 +524,30 @@ class H3QwenVLGenerateText:
                         ),
                     },
                 ),
+                "attention_backend": (
+                    list(ATTENTION_BACKENDS),
+                    {
+                        "default": ATTENTION_AUTO,
+                        "tooltip": (
+                            "Attention used by the Qwen language layers. SageAttention 2 "
+                            "uses ComfyUI's 'sage' backend (including SM120 builds on "
+                            "Blackwell). Comfy Kitchen INT8 requires a compatible "
+                            "comfy-kitchen build. Auto preserves ComfyUI's normal selector."
+                        ),
+                    },
+                ),
+                "decode_backend": (
+                    list(DECODE_BACKENDS),
+                    {
+                        "default": DECODE_AUTO,
+                        "tooltip": (
+                            "KV-cache decode path. Auto enables Comfy Kitchen's fixed-KV "
+                            "Flash Attention decode when available and otherwise uses the "
+                            "standard cache. Select standard to make SageAttention 2 handle "
+                            "one-token decode instead."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "image": (
@@ -528,6 +583,8 @@ class H3QwenVLGenerateText:
         clean_output: bool,
         generation_overlay: str = NO_OVERLAY,
         overlay_strength: float = 1.0,
+        attention_backend: str = ATTENTION_AUTO,
+        decode_backend: str = DECODE_AUTO,
         image=None,
     ):
         identity = validate_h3_base_clip(clip)
@@ -561,6 +618,13 @@ class H3QwenVLGenerateText:
             "presence_penalty": float(presence_penalty),
             "seed": int(seed),
         }
+        try:
+            attention_backend_id = ATTENTION_BACKEND_IDS[attention_backend]
+            decode_backend_id = DECODE_BACKEND_IDS[decode_backend]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported attention setting: {exc.args[0]!r}") from exc
+
+        attention_runtime = {}
         generated_ids = _generate_with_tail(
             clip,
             tail_name,
@@ -570,6 +634,9 @@ class H3QwenVLGenerateText:
                 None if generation_overlay == NO_OVERLAY else generation_overlay
             ),
             overlay_strength=overlay_strength,
+            attention_backend=attention_backend_id,
+            decode_backend=decode_backend_id,
+            runtime_report=attention_runtime,
         )
         raw_output = str(clip.decode(generated_ids) or "")
         generated_text = (
@@ -587,10 +654,12 @@ class H3QwenVLGenerateText:
             if generation_overlay != NO_OVERLAY
             else "generation overlay=none"
         )
+        attention_report = attention_runtime.get("attention", attention_backend)
+        decode_report = attention_runtime.get("decode", decode_backend)
         report = (
             f"Generation completed with H3 base {identity} and tail {tail_name}; "
             f"{len(images)} image(s); sampling={sampling}; thinking={str(thinking).lower()}; "
-            f"{overlay_report}. "
+            f"attention={attention_report}; decode={decode_report}; {overlay_report}. "
             "The temporary tail was unloaded after generation. The connected base CLIP "
             "weights were left unchanged."
         )

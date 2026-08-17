@@ -118,6 +118,88 @@ def test_chunked_head_rejects_invalid_convrot_layout(monkeypatch):
         tail_module._validate_int8_head(weight, weight._qdata, weight._params.scale)
 
 
+def test_tail_kv_cache_delegates_to_comfy_llama(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    expected = [object()]
+    calls = []
+    model = SimpleNamespace(
+        init_kv_cache=lambda *args: calls.append(args) or expected,
+    )
+    tail = object.__new__(tail_module.Qwen3VL32BGenerationTail)
+    torch.nn.Module.__init__(tail)
+    tail.model = model
+
+    actual = tail.init_kv_cache(1, 512, "cuda:0", torch.bfloat16)
+
+    assert actual is expected
+    assert calls == [(1, 512, "cuda:0", torch.bfloat16)]
+
+
+def test_attention_runtime_selects_sage2_and_fixed_kv_then_restores(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    attention = ModuleType("comfy.ldm.modules.attention")
+    sage_function = object()
+    attention.get_attention_function = lambda name: (
+        sage_function if name == "sage" else None
+    )
+    monkeypatch.setitem(sys.modules, "comfy.ldm", ModuleType("comfy.ldm"))
+    monkeypatch.setitem(
+        sys.modules, "comfy.ldm.modules", ModuleType("comfy.ldm.modules")
+    )
+    monkeypatch.setitem(sys.modules, "comfy.ldm.modules.attention", attention)
+
+    def original_selector(*_args, **_kwargs):
+        return "original"
+
+    tail_module.llama.optimized_attention_for_device = original_selector
+    monkeypatch.setattr(
+        tail_module, "_comfy_kitchen_decode_available", lambda _device: True
+    )
+    base = SimpleNamespace(model=SimpleNamespace(fixed_kv=False))
+    tail = SimpleNamespace(model=SimpleNamespace(fixed_kv=False))
+    report = {}
+
+    with tail_module._use_attention_runtime(
+        base,
+        tail,
+        "cuda:0",
+        attention_backend="sage",
+        decode_backend="auto",
+        runtime_report=report,
+    ):
+        assert tail_module.llama.optimized_attention_for_device("cuda:0") is (
+            sage_function
+        )
+        assert base.model.fixed_kv is True
+        assert tail.model.fixed_kv is True
+        assert report == {
+            "attention": "SageAttention 2",
+            "decode": "Comfy Kitchen fixed-KV Flash Attention",
+        }
+
+    assert tail_module.llama.optimized_attention_for_device is original_selector
+    assert base.model.fixed_kv is False
+    assert tail.model.fixed_kv is False
+
+
+def test_required_comfy_kitchen_decode_fails_when_unavailable(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    monkeypatch.setattr(
+        tail_module, "_comfy_kitchen_decode_available", lambda _device: False
+    )
+    base = SimpleNamespace(model=SimpleNamespace(fixed_kv=False))
+    tail = SimpleNamespace(model=SimpleNamespace(fixed_kv=False))
+
+    with pytest.raises(RuntimeError, match="explicitly requested but is unavailable"):
+        with tail_module._use_attention_runtime(
+            base,
+            tail,
+            "cuda:0",
+            decode_backend="comfy_kitchen",
+        ):
+            pass
+
+
 def test_tail_temporaries_finish_before_managed_unload(monkeypatch):
     tail_module = _load_tail_module(monkeypatch)
     events = []
@@ -292,8 +374,7 @@ def test_overlay_prefixes_require_seven_adapters_per_layer(monkeypatch):
     )
     state = {
         (
-            f"{tail_module.OVERLAY_PREFIX}.layers.{layer}.{module}"
-            ".lora_A.weight"
+            f"{tail_module.OVERLAY_PREFIX}.layers.{layer}.{module}.lora_A.weight"
         ): torch.zeros(1, 1)
         for layer in range(64)
         for module in modules
@@ -327,10 +408,9 @@ def test_generation_overlay_uses_clone_and_unloads_both_models(monkeypatch):
     monkeypatch.setattr(
         tail_module,
         "_clone_base_with_overlay",
-        lambda base_clip, state, strength: events.append(
-            ("base_overlay", base_clip, state, strength)
-        )
-        or working_clip,
+        lambda base_clip, state, strength: (
+            events.append(("base_overlay", base_clip, state, strength)) or working_clip
+        ),
     )
     monkeypatch.setattr(
         tail_module,
@@ -352,8 +432,8 @@ def test_generation_overlay_uses_clone_and_unloads_both_models(monkeypatch):
             ("tail_overlay", tail_model, patcher, state, strength)
         ),
     )
-    tail_module.comfy.model_management.load_models_gpu = (
-        lambda patchers, **kwargs: events.append(("load_models", patchers, kwargs))
+    tail_module.comfy.model_management.load_models_gpu = lambda patchers, **kwargs: (
+        events.append(("load_models", patchers, kwargs))
     )
     tail_module.comfy.model_management.unload_model_and_clones = (
         lambda patcher, **kwargs: events.append(("unload", patcher, kwargs))

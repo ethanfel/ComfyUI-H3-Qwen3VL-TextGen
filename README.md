@@ -28,6 +28,8 @@ Combines:
 - separate editable system and user prompts;
 - an optional `IMAGE` batch;
 - deterministic or sampled decoding controls;
+- selectable ComfyUI, SageAttention 2, Comfy Kitchen INT8, or PyTorch attention;
+- optional Comfy Kitchen fixed-KV Flash Attention decoding;
 - optional Qwen thinking mode.
 
 It returns cleaned text, untouched decoded output, the textual chat prompt, the resolved system prompt, and a generation report.
@@ -88,6 +90,26 @@ The optional IMAGE batch can be interpreted as its first image, the first N imag
 The tail loader only lists filenames containing `generation_tail_50_63`. Runtime validation additionally requires exactly source layers 50–63 plus `model.norm.weight` and `model.lm_head.weight`.
 
 The current quantized LM-head path supports the published ComfyUI `int8_tensorwise` ConvRot layout. Incompatible or incomplete tail artifacts fail with an explicit error instead of silently producing corrupted text.
+
+## Attention acceleration
+
+`attention_backend` controls the regular attention function used by Qwen's
+language layers. `SageAttention 2` selects ComfyUI's registered `sage` backend;
+on Blackwell this requires a SageAttention 2 build compiled for SM120. This
+local selection is necessary because ComfyUI's Qwen implementation otherwise
+requests its small-input attention path directly.
+
+`Comfy Kitchen INT8` selects ComfyUI's registered INT8 attention kernel. It
+requires a `comfy-kitchen` build that reports INT8 attention support. Missing
+explicit backends produce a clear error instead of silently selecting an
+unrelated implementation.
+
+`decode_backend` is separate because one-token autoregressive decoding can use
+Comfy Kitchen's fixed-KV Flash Attention kernel directly. Its default is
+`auto (Comfy Kitchen if available)`, which enables that path on compatible
+devices and falls back to the standard KV cache otherwise. Select `standard KV
+cache` if you specifically want SageAttention 2 to handle decode calls too.
+The generation report records the paths selected at runtime.
 
 ## Download the generation tails
 
