@@ -7,6 +7,7 @@ from nodes import (
     DEFAULT_SYSTEM_PROMPT,
     H3QwenVLGenerateText,
     H3QwenVLGenerationTailLoader,
+    NO_OVERLAY,
     TAIL_TYPE,
     clean_generated_text,
     format_qwen_chat,
@@ -78,6 +79,8 @@ def test_two_loader_schema_requires_base_clip_and_dedicated_tail():
     loader = H3QwenVLGenerationTailLoader.INPUT_TYPES()
     assert generator["required"]["clip"][0] == "CLIP"
     assert generator["required"]["tail_clip"][0] == TAIL_TYPE
+    assert generator["required"]["generation_overlay"][0][0] == NO_OVERLAY
+    assert generator["required"]["overlay_strength"][1]["default"] == 1.0
     assert "tail_name" in loader["required"]
     assert H3QwenVLGenerationTailLoader.RETURN_TYPES == (TAIL_TYPE,)
     assert H3QwenVLGenerationTailLoader.RETURN_NAMES == ("tail_clip",)
@@ -122,8 +125,17 @@ def test_generation_routes_base_tokens_and_images_through_tail(monkeypatch):
     batch = FakeImageBatch(["a", "b", "c"])
     tail_calls = []
 
-    def generate_with_tail(base, tail_name, tokens, options):
-        tail_calls.append((base, tail_name, tokens, options))
+    def generate_with_tail(
+        base,
+        tail_name,
+        tokens,
+        options,
+        overlay_name=None,
+        overlay_strength=1.0,
+    ):
+        tail_calls.append(
+            (base, tail_name, tokens, options, overlay_name, overlay_strength)
+        )
         return [101, 102]
 
     monkeypatch.setattr(nodes, "_generate_with_tail", generate_with_tail)
@@ -157,11 +169,41 @@ def test_generation_routes_base_tokens_and_images_through_tail(monkeypatch):
                 "presence_penalty": 0.0,
                 "seed": 42,
             },
+            None,
+            1.0,
         )
     ]
     assert "3 image(s)" in report
     assert "temporary tail was unloaded" in report
-    assert "base CLIP was left" in report
+    assert "base CLIP weights were left unchanged" in report
+
+
+def test_generation_overlay_is_forwarded_only_to_text_generation(monkeypatch):
+    clip = FakeClip(decoded="answer")
+    calls = []
+
+    def generate_with_tail(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [101, 102]
+
+    monkeypatch.setattr(nodes, "_generate_with_tail", generate_with_tail)
+    result = H3QwenVLGenerateText().generate_text(
+        **generation_kwargs(
+            clip=clip,
+            generation_overlay=(
+                "MiniMax H3/h3_prompt_generation_overlay_test.safetensors"
+            ),
+            overlay_strength=0.8,
+        )
+    )
+
+    assert result[0] == "answer"
+    assert calls[0][1] == {
+        "overlay_name": "MiniMax H3/h3_prompt_generation_overlay_test.safetensors",
+        "overlay_strength": 0.8,
+    }
+    assert "generation overlay=MiniMax H3/" in result[-1]
+    assert "at 0.8" in result[-1]
 
 
 def test_deterministic_generation_disables_tail_sampling(monkeypatch):
@@ -170,7 +212,7 @@ def test_deterministic_generation_disables_tail_sampling(monkeypatch):
     monkeypatch.setattr(
         nodes,
         "_generate_with_tail",
-        lambda _clip, _tail, _tokens, options: (
+        lambda _clip, _tail, _tokens, options, **_kwargs: (
             options_seen.append(options) or [101, 102]
         ),
     )

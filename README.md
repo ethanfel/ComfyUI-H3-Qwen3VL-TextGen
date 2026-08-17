@@ -24,6 +24,7 @@ Combines:
 
 - `clip`: MiniMax H3's normal 50-layer Qwen3-VL-32B text encoder, loaded with ComfyUI's standard `Load CLIP` node;
 - `tail_clip`: output from `H3 Qwen VL Generation Tail Loader`;
+- an optional generation-only Qwen3-VL-32B overlay and strength;
 - separate editable system and user prompts;
 - an optional `IMAGE` batch;
 - deterministic or sampled decoding controls;
@@ -42,7 +43,41 @@ Optional IMAGE batch ───── image ───────┘
 
 The normal H3 CLIP supplies tokenization, embeddings, vision processing, and language layers 0–49. During generation the node loads the tail as a second ComfyUI-managed model, runs layers 0–49 and 50–63 sequentially for every token, and evaluates the tail's final norm and LM head.
 
-After generation, only the temporary tail is explicitly unloaded. The connected base CLIP remains under normal ComfyUI model-residency management.
+Without an overlay, only the temporary tail is explicitly unloaded. With an
+overlay selected, the temporary patched base clone is unloaded as well. The
+original connected base CLIP remains under normal ComfyUI model-residency
+management and its weights are unchanged.
+
+## Optional learned generation overlay
+
+The `generation_overlay` widget lists compatible files under
+`models/loras` whose names contain both `h3` and `generation_overlay`.
+Select
+`minimax_h3_qwen3vl32b__prompt_generation_overlay__polaris_r16_plus_heretic_v2.safetensors`
+and start with `overlay_strength = 1.0`.
+
+The overlay is attached with ComfyUI bypass LoRA hooks only for the text
+generation call. Its layers 0–49 run on a temporary clone of the connected
+MiniMax H3 CLIP, while layers 50–63 run on the temporary generation tail.
+Both sets of hooks are removed during cleanup. The connected CLIP weights used
+later for H3 video conditioning are not rewritten or merged.
+
+This overlay is a Qwen text-encoder artifact, not a MiniMax H3 diffusion LoRA.
+Do not connect it to a normal H3 diffusion-model LoRA loader.
+
+## Example workflow
+
+Load
+[`example_workflows/h3_qwen_vl_standalone_polaris_overlay.json`](example_workflows/h3_qwen_vl_standalone_polaris_overlay.json)
+in ComfyUI for a minimal text-only graph. It selects the official H3 INT8
+ConvRot encoder, its matching INT8 generation tail, and the experimental
+Polaris r16 + Heretic-v2 generation overlay at strength `1.0`. The workflow
+contains download metadata for all three artifacts and exposes both generated
+text and the generation report.
+
+The node's general default remains **no overlay**. The bundled workflow opts in
+explicitly so official Qwen behavior remains the safe baseline for other
+workflows.
 
 ## Images
 
@@ -65,6 +100,12 @@ ComfyUI/models/text_encoders/
 ```
 
 Then restart ComfyUI or refresh its model list so the dedicated tail loader can discover it.
+
+Place a compatible generation overlay under:
+
+```text
+ComfyUI/models/loras/
+```
 
 ## Installation
 

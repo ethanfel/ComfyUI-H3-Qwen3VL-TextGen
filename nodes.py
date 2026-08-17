@@ -15,6 +15,7 @@ DEFAULT_SYSTEM_PROMPT = (
 # connect when both packs are installed. The descriptor shape is identical too.
 TAIL_TYPE = "MINIMAX_H3_GENERATION_TAIL"
 NO_TAIL_FOUND = "[no H3 generation_tail_50_63 file found]"
+NO_OVERLAY = "[none — use official H3 generation weights]"
 
 
 def _tokenizer_identity(clip: Any) -> str:
@@ -74,6 +75,21 @@ def _tail_choices() -> list[str]:
     return sorted(names, key=str.casefold) or [NO_TAIL_FOUND]
 
 
+def _overlay_choices() -> list[str]:
+    """List only generation overlays built for the H3 Qwen3-VL stack."""
+
+    try:
+        import folder_paths
+    except ImportError:
+        return [NO_OVERLAY]
+    names = [
+        name
+        for name in folder_paths.get_filename_list("loras")
+        if "h3" in name.casefold() and "generation_overlay" in name.casefold()
+    ]
+    return [NO_OVERLAY, *sorted(names, key=str.casefold)]
+
+
 def _resolve_tail_name(tail_clip: Any) -> str:
     if isinstance(tail_clip, str):
         name = tail_clip
@@ -89,14 +105,28 @@ def _resolve_tail_name(tail_clip: Any) -> str:
     return name
 
 
-def _generate_with_tail(clip, tail_name: str, tokens, generation_options: dict):
+def _generate_with_tail(
+    clip,
+    tail_name: str,
+    tokens,
+    generation_options: dict,
+    overlay_name: str | None = None,
+    overlay_strength: float = 1.0,
+):
     """Lazy import keeps node discovery and isolated tests lightweight."""
 
     try:
         from .hybrid_tail import generate_with_tail
     except ImportError:
         from hybrid_tail import generate_with_tail
-    return generate_with_tail(clip, tail_name, tokens, generation_options)
+    return generate_with_tail(
+        clip,
+        tail_name,
+        tokens,
+        generation_options,
+        overlay_name=overlay_name,
+        overlay_strength=overlay_strength,
+    )
 
 
 def _image_count(image: Any) -> int:
@@ -272,6 +302,31 @@ class H3QwenVLGenerateText:
                             "layers 50-63, final normalization, and the language-model "
                             "head only while text is generated."
                         )
+                    },
+                ),
+                "generation_overlay": (
+                    _overlay_choices(),
+                    {
+                        "tooltip": (
+                            "Optional Qwen3-VL-32B overlay used only for this text "
+                            "generation call. Layers 0-49 are attached to a temporary "
+                            "clone of the connected CLIP and layers 50-63 to the "
+                            "temporary tail. The connected H3 conditioning CLIP is "
+                            "restored unchanged afterward."
+                        )
+                    },
+                ),
+                "overlay_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": -2.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Strength of the temporary text-generation overlay. Start "
+                            "at 1.0. This does not change H3 video-conditioning weights."
+                        ),
                     },
                 ),
                 "system_prompt": (
@@ -471,6 +526,8 @@ class H3QwenVLGenerateText:
         image_batch_mode: str,
         max_images: int,
         clean_output: bool,
+        generation_overlay: str = NO_OVERLAY,
+        overlay_strength: float = 1.0,
         image=None,
     ):
         identity = validate_h3_base_clip(clip)
@@ -504,7 +561,16 @@ class H3QwenVLGenerateText:
             "presence_penalty": float(presence_penalty),
             "seed": int(seed),
         }
-        generated_ids = _generate_with_tail(clip, tail_name, tokens, generation_options)
+        generated_ids = _generate_with_tail(
+            clip,
+            tail_name,
+            tokens,
+            generation_options,
+            overlay_name=(
+                None if generation_overlay == NO_OVERLAY else generation_overlay
+            ),
+            overlay_strength=overlay_strength,
+        )
         raw_output = str(clip.decode(generated_ids) or "")
         generated_text = (
             clean_generated_text(raw_output) if clean_output else raw_output
@@ -516,11 +582,17 @@ class H3QwenVLGenerateText:
                 "and LM head."
             )
 
+        overlay_report = (
+            f"generation overlay={generation_overlay} at {overlay_strength:g}"
+            if generation_overlay != NO_OVERLAY
+            else "generation overlay=none"
+        )
         report = (
             f"Generation completed with H3 base {identity} and tail {tail_name}; "
-            f"{len(images)} image(s); sampling={sampling}; thinking={str(thinking).lower()}. "
+            f"{len(images)} image(s); sampling={sampling}; thinking={str(thinking).lower()}; "
+            f"{overlay_report}. "
             "The temporary tail was unloaded after generation. The connected base CLIP "
-            "was left under ComfyUI model-residency management."
+            "weights were left unchanged."
         )
         return (
             generated_text,

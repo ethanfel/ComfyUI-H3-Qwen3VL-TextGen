@@ -16,10 +16,13 @@ import torch
 
 import folder_paths
 import comfy.hooks
+import comfy.lora
+import comfy.lora_convert
 import comfy.model_management
 import comfy.model_patcher
 import comfy.ops
 import comfy.utils
+import comfy.weight_adapter
 from comfy.text_encoders import llama
 
 
@@ -29,6 +32,11 @@ FULL_LAYER_COUNT = 64
 RUNTIME_HEADROOM = 6 * 1024**3
 LM_HEAD_CHUNK_ROWS = 4096
 LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
+OVERLAY_PREFIX = "text_encoders.qwen3vl_32b.transformer.model"
+OVERLAY_KEY = re.compile(
+    rf"^{re.escape(OVERLAY_PREFIX)}\.layers\.(\d+)\.(.+)$"
+)
+EXPECTED_ADAPTERS_PER_LAYER = 7
 
 
 def _layout_name(weight):
@@ -277,6 +285,116 @@ def _build_tail(name, load_device, offload_device):
     return tail, patcher
 
 
+def _load_generation_overlay(name):
+    path = folder_paths.get_full_path_or_raise("loras", name)
+    state, metadata = comfy.utils.load_torch_file(
+        path, safe_load=True, return_metadata=True
+    )
+    metadata = metadata or {}
+    if metadata.get("overlay_type") != "qwen3vl32b_h3_generation_overlay":
+        raise ValueError(
+            "generation_overlay is not a Qwen3-VL-32B H3 generation overlay"
+        )
+    return comfy.lora_convert.convert_lora(state)
+
+
+def _overlay_prefixes(state, first_layer, last_layer):
+    prefixes = set()
+    suffix = ".lora_A.weight"
+    for key in state:
+        if not key.endswith(suffix):
+            continue
+        prefix = key[: -len(suffix)]
+        match = OVERLAY_KEY.match(prefix)
+        if match is None:
+            continue
+        layer = int(match.group(1))
+        if first_layer <= layer < last_layer:
+            prefixes.add(prefix)
+    expected = (last_layer - first_layer) * EXPECTED_ADAPTERS_PER_LAYER
+    if len(prefixes) != expected:
+        raise ValueError(
+            f"generation_overlay needs {expected} adapters for layers "
+            f"{first_layer}..{last_layer - 1}; found {len(prefixes)}"
+        )
+    return prefixes
+
+
+def _attach_bypass_adapters(patcher, model, loaded, strength, label):
+    manager = comfy.weight_adapter.BypassInjectionManager()
+    state_keys = set(model.state_dict())
+    attached = set()
+    for key, adapter in loaded.items():
+        if not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
+            raise TypeError(
+                f"{label} supports LoRA adapters only; {key} is "
+                f"{type(adapter).__name__}"
+            )
+        if key in state_keys:
+            manager.add_adapter(key, adapter, strength=float(strength))
+            attached.add(key)
+    if len(attached) != len(loaded):
+        missing = sorted(set(loaded) - attached)
+        raise ValueError(f"{label} targets missing model weights: {missing[:8]}")
+    injections = manager.create_injections(model)
+    if manager.get_hook_count() != len(attached):
+        raise RuntimeError(
+            f"{label} created {manager.get_hook_count()} hooks for "
+            f"{len(attached)} adapters"
+        )
+    patcher.set_injections(label, injections)
+    return len(attached)
+
+
+def _clone_base_with_overlay(clip, state, strength):
+    prefixes = _overlay_prefixes(state, 0, TAIL_FIRST_LAYER)
+    key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, {})
+    key_map = {key: value for key, value in key_map.items() if key in prefixes}
+    loaded = comfy.lora.load_lora(state, key_map, log_missing=False)
+    if len(loaded) != len(prefixes):
+        raise ValueError(
+            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} "
+            "base adapters"
+        )
+    patched = clip.clone()
+    _attach_bypass_adapters(
+        patched.patcher,
+        patched.cond_stage_model,
+        loaded,
+        strength,
+        "h3_generation_overlay_base",
+    )
+    return patched
+
+
+def _attach_tail_overlay(tail, patcher, state, strength):
+    prefixes = _overlay_prefixes(state, TAIL_FIRST_LAYER, FULL_LAYER_COUNT)
+    tail_keys = set(tail.state_dict())
+    key_map = {}
+    for prefix in prefixes:
+        match = OVERLAY_KEY.match(prefix)
+        global_layer = int(match.group(1))
+        module = match.group(2)
+        target = (
+            f"model.layers.{global_layer - TAIL_FIRST_LAYER}.{module}.weight"
+        )
+        if target in tail_keys:
+            key_map[prefix] = target
+    loaded = comfy.lora.load_lora(state, key_map, log_missing=False)
+    if len(loaded) != len(prefixes):
+        raise ValueError(
+            f"generation_overlay loaded {len(loaded)} of {len(prefixes)} "
+            "tail adapters"
+        )
+    _attach_bypass_adapters(
+        patcher,
+        tail,
+        loaded,
+        strength,
+        "h3_generation_overlay_tail",
+    )
+
+
 def _get_minimax_base(clip):
     cond_stage = getattr(clip, "cond_stage_model", None)
     clip_name = getattr(cond_stage, "clip", "qwen3vl_32b")
@@ -388,14 +506,23 @@ def _generate_tail_tokens(
     return generated
 
 
-def generate_with_tail(clip, tail_name, tokens, generation_options):
+def generate_with_tail(
+    clip,
+    tail_name,
+    tokens,
+    generation_options,
+    overlay_name=None,
+    overlay_strength=1.0,
+):
     """Generate through base layers 0..49 and a temporary tail 50..63."""
 
-    wrapper, base = _get_minimax_base(clip)
+    working_clip = clip
+    overlay_state = None
     load_device = clip.patcher.load_device
     offload_device = clip.patcher.offload_device
     tail = tail_patcher = None
-    old_execution_device = wrapper.execution_device
+    wrapper = base = None
+    old_execution_device = None
     result = None
     primary_error = primary_traceback = None
     cleanup_errors = []
@@ -405,9 +532,20 @@ def generate_with_tail(clip, tail_name, tokens, generation_options):
         cleanup_errors.append(exc)
 
     try:
+        if overlay_name:
+            overlay_state = _load_generation_overlay(overlay_name)
+            working_clip = _clone_base_with_overlay(
+                clip, overlay_state, overlay_strength
+            )
+        wrapper, base = _get_minimax_base(working_clip)
+        old_execution_device = wrapper.execution_device
         tail, tail_patcher = _build_tail(tail_name, load_device, offload_device)
+        if overlay_state is not None:
+            _attach_tail_overlay(
+                tail, tail_patcher, overlay_state, overlay_strength
+            )
         comfy.model_management.load_models_gpu(
-            [clip.patcher, tail_patcher], memory_required=RUNTIME_HEADROOM
+            [working_clip.patcher, tail_patcher], memory_required=RUNTIME_HEADROOM
         )
         wrapper.execution_device = load_device
         # Keeping CUDA temporaries inside a separate call is deliberate: its KV
@@ -429,10 +567,11 @@ def generate_with_tail(clip, tail_name, tokens, generation_options):
         # reachable through the traceback while the original error propagates.
         traceback.clear_frames(primary_traceback)
     finally:
-        try:
-            wrapper.execution_device = old_execution_device
-        except BaseException as exc:
-            remember_cleanup_error(exc)
+        if wrapper is not None:
+            try:
+                wrapper.execution_device = old_execution_device
+            except BaseException as exc:
+                remember_cleanup_error(exc)
         if tail_patcher is not None:
             try:
                 comfy.model_management.unload_model_and_clones(
@@ -442,6 +581,16 @@ def generate_with_tail(clip, tail_name, tokens, generation_options):
                 )
             except BaseException as exc:
                 remember_cleanup_error(exc)
+        if working_clip is not clip:
+            try:
+                comfy.model_management.unload_model_and_clones(
+                    working_clip.patcher,
+                    unload_additional_models=False,
+                    all_devices=True,
+                )
+            except BaseException as exc:
+                remember_cleanup_error(exc)
+        working_clip = overlay_state = None
         tail = tail_patcher = None
         try:
             gc.collect()

@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-h3-qwen3vl-textgen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Standalone generation with MiniMax H3's Qwen3-VL base and tail"
 requires-python = ">=3.10"
 dependencies = []

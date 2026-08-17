@@ -28,10 +28,21 @@ def _load_tail_module(monkeypatch):
     text_encoders.llama = llama
     comfy.text_encoders = text_encoders
 
-    for name in ("hooks", "model_management", "model_patcher", "ops", "utils"):
+    for name in (
+        "hooks",
+        "lora",
+        "lora_convert",
+        "model_management",
+        "model_patcher",
+        "ops",
+        "utils",
+        "weight_adapter",
+    ):
         submodule = ModuleType(f"comfy.{name}")
         setattr(comfy, name, submodule)
         monkeypatch.setitem(sys.modules, f"comfy.{name}", submodule)
+    comfy.lora_convert.convert_lora = lambda state: state
+    comfy.weight_adapter.WeightAdapterBase = type("WeightAdapterBase", (), {})
     monkeypatch.setitem(sys.modules, "comfy", comfy)
     monkeypatch.setitem(sys.modules, "comfy.text_encoders", text_encoders)
     monkeypatch.setitem(sys.modules, "comfy.text_encoders.llama", llama)
@@ -266,3 +277,118 @@ def test_tail_cleanup_failure_does_not_mask_generation_error(monkeypatch):
         tail_module.generate_with_tail(clip, "tail.safetensors", {}, {})
 
     assert cache_flushes == [{"force": True}]
+
+
+def test_overlay_prefixes_require_seven_adapters_per_layer(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    modules = (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    )
+    state = {
+        (
+            f"{tail_module.OVERLAY_PREFIX}.layers.{layer}.{module}"
+            ".lora_A.weight"
+        ): torch.zeros(1, 1)
+        for layer in range(64)
+        for module in modules
+    }
+
+    assert len(tail_module._overlay_prefixes(state, 0, 50)) == 350
+    assert len(tail_module._overlay_prefixes(state, 50, 64)) == 98
+    state.pop(next(key for key in state if ".layers.63." in key))
+    with pytest.raises(ValueError, match="needs 98 adapters"):
+        tail_module._overlay_prefixes(state, 50, 64)
+
+
+def test_generation_overlay_uses_clone_and_unloads_both_models(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    events = []
+    wrapper = SimpleNamespace(execution_device="cpu")
+    base = object()
+    original_patcher = SimpleNamespace(load_device="cuda:0", offload_device="cpu")
+    working_patcher = object()
+    tail_patcher = object()
+    clip = SimpleNamespace(patcher=original_patcher)
+    working_clip = SimpleNamespace(patcher=working_patcher)
+    tail = object()
+    overlay_state = {"overlay": torch.ones(1)}
+
+    monkeypatch.setattr(
+        tail_module,
+        "_load_generation_overlay",
+        lambda name: events.append(("overlay_load", name)) or overlay_state,
+    )
+    monkeypatch.setattr(
+        tail_module,
+        "_clone_base_with_overlay",
+        lambda base_clip, state, strength: events.append(
+            ("base_overlay", base_clip, state, strength)
+        )
+        or working_clip,
+    )
+    monkeypatch.setattr(
+        tail_module,
+        "_get_minimax_base",
+        lambda base_clip: (
+            events.append(("get_base", base_clip)) or wrapper,
+            base,
+        ),
+    )
+    monkeypatch.setattr(
+        tail_module,
+        "_build_tail",
+        lambda *_args: (tail, tail_patcher),
+    )
+    monkeypatch.setattr(
+        tail_module,
+        "_attach_tail_overlay",
+        lambda tail_model, patcher, state, strength: events.append(
+            ("tail_overlay", tail_model, patcher, state, strength)
+        ),
+    )
+    tail_module.comfy.model_management.load_models_gpu = (
+        lambda patchers, **kwargs: events.append(("load_models", patchers, kwargs))
+    )
+    tail_module.comfy.model_management.unload_model_and_clones = (
+        lambda patcher, **kwargs: events.append(("unload", patcher, kwargs))
+    )
+    tail_module.comfy.model_management.soft_empty_cache = lambda **_kwargs: None
+    monkeypatch.setattr(tail_module, "_generate_tail_tokens", lambda *_args: [7])
+
+    result = tail_module.generate_with_tail(
+        clip,
+        "tail.safetensors",
+        {},
+        {},
+        overlay_name="h3_generation_overlay.safetensors",
+        overlay_strength=0.75,
+    )
+
+    assert result == [7]
+    assert ("base_overlay", clip, overlay_state, 0.75) in events
+    assert ("tail_overlay", tail, tail_patcher, overlay_state, 0.75) in events
+    assert (
+        "load_models",
+        [working_patcher, tail_patcher],
+        {"memory_required": tail_module.RUNTIME_HEADROOM},
+    ) in events
+    unloads = [event for event in events if event[0] == "unload"]
+    assert unloads == [
+        (
+            "unload",
+            tail_patcher,
+            {"unload_additional_models": False, "all_devices": True},
+        ),
+        (
+            "unload",
+            working_patcher,
+            {"unload_additional_models": False, "all_devices": True},
+        ),
+    ]
+    assert wrapper.execution_device == "cpu"
