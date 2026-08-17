@@ -392,3 +392,59 @@ def test_generation_overlay_uses_clone_and_unloads_both_models(monkeypatch):
         ),
     ]
     assert wrapper.execution_device == "cpu"
+
+
+def test_finite_logits_validation_accepts_valid_tensors(monkeypatch):
+    tail_module = _load_tail_module(monkeypatch)
+    value = torch.ones(1, 2, 3)
+
+    tail_module._validate_finite_logits(value, value, value, 0)
+
+
+@pytest.mark.parametrize(
+    ("base_hidden", "full_hidden", "logits", "expected_stage"),
+    [
+        (
+            torch.tensor([float("nan")]),
+            torch.tensor([float("nan")]),
+            torch.tensor([float("nan")]),
+            "base language layers 0-49",
+        ),
+        (
+            torch.ones(1),
+            torch.tensor([float("inf")]),
+            torch.tensor([float("inf")]),
+            "generation-tail language layers 50-63",
+        ),
+        (
+            torch.ones(1),
+            torch.ones(1),
+            torch.tensor([float("nan")]),
+            "generation-tail LM head",
+        ),
+    ],
+)
+def test_finite_logits_validation_reports_first_bad_stage(
+    monkeypatch,
+    base_hidden,
+    full_hidden,
+    logits,
+    expected_stage,
+):
+    tail_module = _load_tail_module(monkeypatch)
+
+    with pytest.raises(FloatingPointError) as error:
+        tail_module._validate_finite_logits(
+            logits,
+            base_hidden,
+            full_hidden,
+            2,
+            "h3_generation_overlay.safetensors",
+            0.75,
+        )
+
+    message = str(error.value)
+    assert "generated token 3" in message
+    assert expected_stage in message
+    assert "strength 0.75" in message
+    assert "before torch.multinomial" in message

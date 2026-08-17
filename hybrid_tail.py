@@ -427,6 +427,51 @@ def _sample(base, logits, options, history, generator):
     )
 
 
+def _tensor_is_finite(tensor):
+    """Synchronize one small reduction before CUDA sampling can assert."""
+
+    return bool(torch.isfinite(tensor).all().item())
+
+
+def _validate_finite_logits(
+    logits,
+    base_hidden,
+    full_hidden,
+    step,
+    overlay_name=None,
+    overlay_strength=1.0,
+):
+    """Stop non-finite generation before torch.multinomial poisons CUDA."""
+
+    if _tensor_is_finite(logits):
+        return
+
+    if not _tensor_is_finite(base_hidden):
+        stage = "base language layers 0-49"
+    elif not _tensor_is_finite(full_hidden):
+        stage = "generation-tail language layers 50-63"
+    else:
+        stage = "generation-tail LM head"
+
+    overlay = (
+        f"overlay={overlay_name!r} at strength {float(overlay_strength):g}"
+        if overlay_name
+        else "overlay=none"
+    )
+    hint = (
+        " Set generation_overlay to [none] to isolate the official NVFP4 "
+        "base/tail. If that succeeds, retry the overlay below strength 1.0."
+        if overlay_name
+        else " Verify that the base encoder and generation tail use the same format."
+    )
+    raise FloatingPointError(
+        "H3 text generation produced NaN or Inf at generated token "
+        f"{int(step) + 1} in {stage} ({overlay}). Sampling was stopped before "
+        "torch.multinomial to avoid a fatal CUDA device-side assertion."
+        + hint
+    )
+
+
 def _generate_tail_tokens(
     wrapper,
     base,
@@ -434,6 +479,8 @@ def _generate_tail_tokens(
     tokens,
     generation_options,
     load_device,
+    overlay_name=None,
+    overlay_strength=1.0,
 ):
     """Own all temporary CUDA generation state in a short-lived stack frame."""
 
@@ -492,6 +539,14 @@ def _generate_tail_tokens(
         )
         full_hidden, _, tail_cache = tail(base_hidden, position_ids, tail_cache)
         logits = tail.logits(full_hidden)[:, -1]
+        _validate_finite_logits(
+            logits,
+            base_hidden,
+            full_hidden,
+            step,
+            overlay_name,
+            overlay_strength,
+        )
         next_token = _sample(base, logits, generation_options, generated, generator)
         token_id = next_token[0].item()
         generated.append(token_id)
@@ -558,6 +613,8 @@ def generate_with_tail(
             tokens,
             generation_options,
             load_device,
+            overlay_name,
+            overlay_strength,
         )
     except BaseException as exc:
         primary_error = exc
